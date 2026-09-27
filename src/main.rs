@@ -19,12 +19,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{
-    io::AsyncWriteExt,
-    process::Command,
-    sync::Semaphore,
-    time::timeout,
-};
+use tokio::{io::AsyncWriteExt, process::Command, sync::Semaphore, time::timeout};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -139,12 +134,19 @@ fn load_config() -> Result<RuntimeConfig> {
         .to_str()
         .ok_or_else(|| anyhow!(".cli-flags.toml path is not UTF-8"))?;
     let parser = BundledFlags2Env::new();
-    parser.audit_config(Some(config_path_text))?;
+    parser
+        .audit_config(Some(config_path_text))
+        .map_err(|error| anyhow!(error.to_string()))?;
 
     let argv = env::args().collect::<Vec<_>>();
-    let parsed = parser.parse_structured(&argv, Some(config_path_text))?;
+    let parsed = parser
+        .parse_structured(&argv, Some(config_path_text))
+        .map_err(|error| anyhow!(error.to_string()))?;
     if !parsed.unknown_options.is_empty() {
-        bail!("unknown command-line options: {}", parsed.unknown_options.len());
+        bail!(
+            "unknown command-line options: {}",
+            parsed.unknown_options.len()
+        );
     }
     if !parsed.errors.is_empty() {
         bail!("invalid command-line values: {}", parsed.errors.join("; "));
@@ -155,7 +157,9 @@ fn load_config() -> Result<RuntimeConfig> {
 
     let mut raw = env::vars().collect::<HashMap<_, _>>();
     raw.extend(parsed.provided_flags);
-    let raw_config = parser.coerce::<CliConfig, _>(&raw, Some(config_path_text))?;
+    let raw_config = parser
+        .coerce::<CliConfig, _>(&raw, Some(config_path_text))
+        .map_err(|error| anyhow!(error.to_string()))?;
 
     let addr = parse_loopback_addr(&raw_config.POEX_DESKTOP_ADDR)?;
     let worker_command = raw_config.POEX_WORKER_COMMAND.trim().to_owned();
@@ -171,7 +175,9 @@ fn load_config() -> Result<RuntimeConfig> {
     let parallelism = usize::try_from(raw_config.POEX_MAX_PARALLEL_INVOCATIONS)
         .ok()
         .filter(|value| *value > 0 && *value <= MAX_PARALLELISM)
-        .ok_or_else(|| anyhow!("POEX_MAX_PARALLEL_INVOCATIONS must be between 1 and {MAX_PARALLELISM}"))?;
+        .ok_or_else(|| {
+            anyhow!("POEX_MAX_PARALLEL_INVOCATIONS must be between 1 and {MAX_PARALLELISM}")
+        })?;
     let token_path = match raw_config.POEX_DESKTOP_TOKEN_FILE {
         Some(path) if !path.trim().is_empty() => expand_home(Path::new(&path))?,
         _ => default_token_path()?,
@@ -337,7 +343,9 @@ fn validate_identifier(name: &str, value: &str) -> Result<(), (StatusCode, Strin
 }
 
 fn parse_loopback_addr(value: &str) -> Result<SocketAddr> {
-    let addr: SocketAddr = value.parse().context("POEX_DESKTOP_ADDR is not a socket address")?;
+    let addr: SocketAddr = value
+        .parse()
+        .context("POEX_DESKTOP_ADDR is not a socket address")?;
     if !is_loopback(addr.ip()) {
         bail!("POEX_DESKTOP_ADDR must bind to loopback");
     }
@@ -401,7 +409,9 @@ fn load_or_create_token(path: &Path) -> Result<String> {
         bail!("desktop daemon token file is malformed");
     }
 
-    let parent = path.parent().ok_or_else(|| anyhow!("token path has no parent"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("token path has no parent"))?;
     std::fs::create_dir_all(parent)?;
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     std::fs::write(path, format!("{token}\n"))?;
