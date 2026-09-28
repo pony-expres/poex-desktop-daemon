@@ -1,0 +1,12 @@
+{
+  "schema": "ores.desktop-generation-consumer/v1",
+  "consumer": {"repository": "pony-expres/poex-desktop-daemon", "role": "desktop_daemon"},
+  "authority": {"repository": "ORESoftware/ores-common-desktop-infra", "revision": "895ed4e43f0d9a6bc39dfd4688e0b5009b1c10ef", "pull_request": 9},
+  "lifecycle": ["prepare", "validate", "compile_build_generation", "stage", "health_check", "atomic_activate", "bounded_drain", "commit"],
+  "rollback": {"required_before_commit": true, "retain_previous_generation": true},
+  "request_semantics": {"new_requests": "active_generation", "existing_requests": "pinned_generation", "generation_identity_required": true},
+  "routing": {"dynamic_route_authority": "shared_router_generation", "edge_proxy_route_authority": false, "stable_edges": ["nginx", "haproxy", "caddy"]},
+  "middleware": {"parameter_changes": "atomic_generation_swap", "code_changes": "wasm_generation_or_proven_beam_upgrade", "beam_code_reload_requires_drain_or_otp_proof": true},
+  "role_requirements": ["sole_lifecycle_authority", "bounded_drain_enforced", "rollback_before_commit", "no_arbitrary_process_commands", "surface_generation_status", "pony_actor_compute_uses_generation_handoff"],
+  "verification": {"shared_conformance_required": true, "product_e2e_required": true, "promotion_state": "candidate"}
+}
