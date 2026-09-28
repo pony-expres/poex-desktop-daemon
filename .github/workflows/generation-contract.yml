@@ -1,0 +1,32 @@
+name: generation-contract
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Validate generation lifecycle contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib, string
+          d=json.loads(pathlib.Path('ores-generation-contract.json').read_text())
+          assert d['schema']=='ores.desktop-generation-consumer/v1'
+          assert d['lifecycle']==['prepare','validate','compile_build_generation','stage','health_check','atomic_activate','bounded_drain','commit']
+          r=d['authority']['revision']; assert len(r)==40 and all(c in string.hexdigits for c in r)
+          assert d['rollback']=={'required_before_commit': True, 'retain_previous_generation': True}
+          assert d['request_semantics']['new_requests']=='active_generation' and d['request_semantics']['existing_requests']=='pinned_generation' and d['request_semantics']['generation_identity_required'] is True
+          assert d['routing']['edge_proxy_route_authority'] is False and {'nginx','haproxy','caddy'}.issubset(d['routing']['stable_edges'])
+          assert d['middleware']['beam_code_reload_requires_drain_or_otp_proof'] is True
+          assert d['verification']['shared_conformance_required'] is True and d['verification']['product_e2e_required'] is True and d['verification']['promotion_state']=='candidate'
+          print('generation contract OK')
+          PY
