@@ -24,12 +24,25 @@ jobs:
       - name: Install declared MSRV
         shell: bash
         run: rustup toolchain install 1.90.0 --profile minimal --component rustfmt,clippy
+      - name: Prepare dependency lock for audit
+        shell: bash
+        run: |
+          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            cargo +1.90.0 fetch --locked
+          else
+            cargo +1.90.0 generate-lockfile
+          fi
       - name: Format
         shell: bash
         run: cargo +1.90.0 fmt --all -- --check
       - name: Clippy
         shell: bash
-        run: cargo +1.90.0 clippy --all-targets -- -D warnings
+        run: cargo +1.90.0 clippy --locked --all-targets -- -D warnings
       - name: Test
         shell: bash
-        run: cargo +1.90.0 test --all-targets
+        run: cargo +1.90.0 test --locked --all-targets
+      - name: Require committed deterministic lockfile
+        shell: bash
+        run: |
+          git ls-files --error-unmatch Cargo.lock >/dev/null
+          git diff --exit-code -- Cargo.lock
