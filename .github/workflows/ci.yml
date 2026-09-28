@@ -24,12 +24,23 @@ jobs:
       - name: Install declared MSRV
         shell: bash
         run: rustup toolchain install 1.90.0 --profile minimal --component rustfmt,clippy
+      - name: Generate deterministic lockfile candidate
+        shell: bash
+        run: cargo +1.90.0 generate-lockfile
+      - name: Retain generated lockfile candidate
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: poex-desktop-daemon-cargo-lock-${{ github.event.pull_request.head.sha || github.sha }}
+          path: Cargo.lock
+          if-no-files-found: error
+          retention-days: 7
       - name: Format
         shell: bash
         run: cargo +1.90.0 fmt --all -- --check
       - name: Clippy
         shell: bash
-        run: cargo +1.90.0 clippy --all-targets -- -D warnings
+        run: cargo +1.90.0 clippy --locked --all-targets -- -D warnings
       - name: Test
         shell: bash
-        run: cargo +1.90.0 test --all-targets
+        run: cargo +1.90.0 test --locked --all-targets
