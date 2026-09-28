@@ -6,6 +6,7 @@ rust-version = "1.90"
 description = "Loopback desktop control plane for Pony Expres"
 
 [dependencies]
+ores-common-desktop-infra = { path = "tmp/dev/ores-common-desktop-infra/infra/rust" }
 anyhow = "1"
 axum = "0.8"
 flags2env = { git = "https://github.com/flags-2-env/flags-2-env.git", rev = "8c8465561075a8d7ebb58074b3a8087138e97d8f" }
