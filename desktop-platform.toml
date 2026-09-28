@@ -1,8 +1,8 @@
 schema_version = "ores.desktop.product/v1"
 product_id = "pony-expres"
 common_kernel_repository = "ORESoftware/ores-common-desktop-infra"
-common_kernel_revision = "0fe05c9a62622564b43354c06612815e50241650"
-distribution_issue = "ORESoftware/ores-common-desktop-infra#13"
+common_kernel_revision = "1de34a491673cff2ff7fedb6ba36f8b6a10ae5a1"
+distribution_issue = "ORESoftware/ores-common-desktop-infra#16"
 runtime_kind = "pony"
 
 [capabilities]
