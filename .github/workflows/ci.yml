@@ -32,6 +32,13 @@ jobs:
           else
             cargo +1.90.0 generate-lockfile
           fi
+      - name: Publish generated lock candidate
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cargo-lock-candidate
+          path: Cargo.lock
+          if-no-files-found: error
       - name: Format
         shell: bash
         run: cargo +1.90.0 fmt --all -- --check
