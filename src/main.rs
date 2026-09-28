@@ -11,6 +11,8 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     env,
+    fs::{self, OpenOptions},
+    io::{ErrorKind, Write},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
@@ -19,13 +21,21 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{io::AsyncWriteExt, process::Command, sync::Semaphore, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    process::Command,
+    sync::Semaphore,
+    time::timeout,
+};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const MAX_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 const MAX_BODY_BYTES: usize = 256 * 1024;
 const MAX_PARALLELISM: usize = 256;
+const MAX_WORKER_STDOUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_WORKER_STDERR_BYTES: usize = 1024 * 1024;
+const MAX_TOKEN_FILE_BYTES: u64 = 4096;
 
 #[allow(non_snake_case)]
 #[derive(Debug, Deserialize)]
@@ -61,6 +71,7 @@ struct AppState {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InvocationRequest {
     invocation_id: String,
     tenant_id: String,
@@ -89,6 +100,12 @@ struct StatusResponse {
     completed: u64,
     failed: u64,
     available_slots: usize,
+}
+
+#[derive(Debug)]
+struct DrainCapture {
+    bytes: Vec<u8>,
+    exceeded: bool,
 }
 
 #[tokio::main]
@@ -231,12 +248,12 @@ async fn invoke(
         ));
     }
 
-    let permit = state
-        .permits
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(internal_error)?;
+    let permit = state.permits.clone().try_acquire_owned().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "fresh Pony worker capacity is exhausted".to_owned(),
+        )
+    })?;
     state.accepted.fetch_add(1, Ordering::Relaxed);
 
     let result = run_fresh_worker(&state, &request, Duration::from_millis(timeout_ms)).await;
@@ -282,21 +299,46 @@ async fn run_fresh_worker(
         .spawn()
         .with_context(|| format!("failed to start {}", state.worker_command))?;
 
-    let payload = serde_json::to_vec(&request.payload_json)?;
     let mut stdin = child
         .stdin
         .take()
         .ok_or_else(|| anyhow!("worker stdin unavailable"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("worker stdout unavailable"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("worker stderr unavailable"))?;
+
+    let payload = serde_json::to_vec(&request.payload_json)?;
     stdin.write_all(&payload).await?;
     stdin.shutdown().await?;
     drop(stdin);
 
-    let output = timeout(deadline, child.wait_with_output())
+    let execution = async {
+        let (status, stdout_capture, stderr_capture) = tokio::join!(
+            child.wait(),
+            drain_bounded(&mut stdout, MAX_WORKER_STDOUT_BYTES),
+            drain_bounded(&mut stderr, MAX_WORKER_STDERR_BYTES),
+        );
+        return Ok::<_, anyhow::Error>((status?, stdout_capture?, stderr_capture?));
+    };
+
+    let (status, stdout_capture, stderr_capture) = timeout(deadline, execution)
         .await
         .map_err(|_| anyhow!("invocation timed out; fresh worker was terminated"))??;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if stdout_capture.exceeded {
+        bail!("worker stdout exceeded {MAX_WORKER_STDOUT_BYTES} bytes");
+    }
+    if stderr_capture.exceeded {
+        bail!("worker stderr exceeded {MAX_WORKER_STDERR_BYTES} bytes");
+    }
+
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_capture.bytes);
         let summary = stderr
             .lines()
             .find(|line| !line.trim().is_empty())
@@ -304,9 +346,36 @@ async fn run_fresh_worker(
         bail!("worker failed: {}", truncate(summary, 512));
     }
 
-    let stdout = String::from_utf8(output.stdout).context("worker stdout was not UTF-8")?;
+    let stdout = String::from_utf8(stdout_capture.bytes).context("worker stdout was not UTF-8")?;
     let payload_json = serde_json::from_str(stdout.trim()).context("worker stdout was not JSON")?;
     return Ok(payload_json);
+}
+
+async fn drain_bounded<R>(reader: &mut R, max_bytes: usize) -> Result<DrainCapture>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    let mut exceeded = false;
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+
+        let remaining = max_bytes.saturating_sub(bytes.len());
+        let retained = remaining.min(read);
+        if retained > 0 {
+            bytes.extend_from_slice(&buffer[..retained]);
+        }
+        if read > retained {
+            exceeded = true;
+        }
+    }
+
+    return Ok(DrainCapture { bytes, exceeded });
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {
@@ -398,33 +467,92 @@ fn expand_home(path: &Path) -> Result<PathBuf> {
     return Ok(path.to_path_buf());
 }
 
-fn load_or_create_token(path: &Path) -> Result<String> {
-    if let Ok(token) = std::fs::read_to_string(path) {
-        let token = token.trim();
-        if token.len() >= 32 && !token.chars().any(char::is_whitespace) {
-            return Ok(token.to_owned());
+fn read_token_file(path: &Path) -> Result<Option<String>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot inspect token file {}", path.display()));
         }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("desktop daemon token path must be a regular non-symlink file");
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_TOKEN_FILE_BYTES {
+        bail!("desktop daemon token file size is invalid");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!("desktop daemon token file must not be accessible by group/other users");
+        }
+    }
+
+    let token = fs::read_to_string(path)
+        .with_context(|| format!("cannot read desktop daemon token file {}", path.display()))?;
+    let token = token.trim();
+    if token.len() < 32 || token.len() > 4096 || token.chars().any(char::is_whitespace) {
         bail!("desktop daemon token file is malformed");
+    }
+    return Ok(Some(token.to_owned()));
+}
+
+fn load_or_create_token(path: &Path) -> Result<String> {
+    if let Some(token) = read_token_file(path)? {
+        return Ok(token);
     }
 
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("token path has no parent"))?;
-    std::fs::create_dir_all(parent)?;
-    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    std::fs::write(path, format!("{token}\n"))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("cannot create token directory {}", parent.display()))?;
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+
+        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        match options.open(path) {
+            Ok(mut file) => {
+                file.write_all(format!("{token}\n").as_bytes())?;
+                file.sync_all()?;
+                return Ok(token);
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                return read_token_file(path)?.ok_or_else(|| {
+                    anyhow!("desktop daemon token file appeared but could not be read")
+                });
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
 
-    return Ok(token);
-}
-
-fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
-    return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
+    #[cfg(not(unix))]
+    {
+        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        match options.open(path) {
+            Ok(mut file) => {
+                file.write_all(format!("{token}\n").as_bytes())?;
+                file.sync_all()?;
+                return Ok(token);
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                return read_token_file(path)?.ok_or_else(|| {
+                    anyhow!("desktop daemon token file appeared but could not be read")
+                });
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -452,5 +580,23 @@ mod tests {
     fn truncates_worker_errors() {
         let value = "x".repeat(1024);
         assert_eq!(truncate(&value, 512).len(), 512);
+    }
+
+    #[tokio::test]
+    async fn bounded_drain_keeps_draining_after_limit() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let write = tokio::spawn(async move {
+            writer.write_all(b"0123456789abcdef").await?;
+            writer.shutdown().await?;
+            return Ok::<_, std::io::Error>(());
+        });
+
+        let capture = drain_bounded(&mut reader, 8).await;
+        assert!(capture.is_ok());
+        if let Ok(capture) = capture {
+            assert_eq!(capture.bytes, b"01234567");
+            assert!(capture.exceeded);
+        }
+        assert!(write.await.is_ok());
     }
 }
