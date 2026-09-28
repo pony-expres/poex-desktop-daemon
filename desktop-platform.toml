@@ -1,0 +1,30 @@
+schema_version = "ores.desktop.product/v1"
+product_id = "pony-expres"
+common_kernel_repository = "ORESoftware/ores-common-desktop-infra"
+common_kernel_revision = "1de34a491673cff2ff7fedb6ba36f8b6a10ae5a1"
+distribution_issue = "ORESoftware/ores-common-desktop-infra#16"
+runtime_kind = "pony"
+
+[capabilities]
+standalone_server = true
+worker_pool = true
+actors = true
+hot_worker_reload = true
+graceful_drain = true
+snapshot = false
+
+[isolation]
+router_separate_from_execution = true
+middleware_separate_from_execution = true
+router_reload_must_not_restart_execution = true
+middleware_reload_must_not_restart_execution = true
+request_generation_pinning = true
+
+[control_plane]
+daemon_is_lifecycle_authority = true
+immutable_deployment_generations = true
+crash_recovery_journal_required = true
+secure_os_credential_store_required = true
+
+[conformance]
+compile_time_shared_crates = "pending_registry_publication"
