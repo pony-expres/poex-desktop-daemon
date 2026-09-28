@@ -399,12 +399,35 @@ fn expand_home(path: &Path) -> Result<PathBuf> {
 }
 
 fn load_or_create_token(path: &Path) -> Result<String> {
-    if let Ok(token) = std::fs::read_to_string(path) {
-        let token = token.trim();
-        if token.len() >= 32 && !token.chars().any(char::is_whitespace) {
-            return Ok(token.to_owned());
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!("desktop daemon token path must not be a symlink");
+            }
+            if !metadata.is_file() {
+                bail!("desktop daemon token path must be a regular file");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    bail!("desktop daemon token file permissions must be 0600 or stricter");
+                }
+            }
+            let token = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read desktop daemon token file {}", path.display()))?;
+            let token = token.trim();
+            if token.len() >= 32 && !token.chars().any(char::is_whitespace) {
+                return Ok(token.to_owned());
+            }
+            bail!("desktop daemon token file is malformed");
         }
-        bail!("desktop daemon token file is malformed");
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect desktop daemon token path {}", path.display())
+            });
+        }
     }
 
     let parent = path
@@ -412,14 +435,21 @@ fn load_or_create_token(path: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("token path has no parent"))?;
     std::fs::create_dir_all(parent)?;
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    std::fs::write(path, format!("{token}\n"))?;
-
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create desktop daemon token file {}", path.display()))?;
+    {
+        use std::io::Write as _;
+        file.write_all(format!("{token}\n").as_bytes())?;
+        file.sync_all()?;
+    }
     return Ok(token);
 }
 
@@ -452,5 +482,20 @@ mod tests {
     fn truncates_worker_errors() {
         let value = "x".repeat(1024);
         assert_eq!(truncate(&value, 512).len(), 512);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_overly_permissive_existing_token_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("poex-token-test-{}", Uuid::new_v4()));
+        let path = root.join("token");
+        std::fs::create_dir_all(&root).expect("create token test directory");
+        std::fs::write(&path, "0123456789abcdef0123456789abcdef\n")
+            .expect("write token fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("set token fixture permissions");
+        assert!(load_or_create_token(&path).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
