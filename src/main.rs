@@ -496,15 +496,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rejects_overly_permissive_existing_token_file() {
+    fn rejects_overly_permissive_existing_token_file() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
+
         let root = std::env::temp_dir().join(format!("poex-token-test-{}", Uuid::new_v4()));
         let path = root.join("token");
-        std::fs::create_dir_all(&root).expect("create token test directory");
-        std::fs::write(&path, "0123456789abcdef0123456789abcdef\n").expect("write token fixture");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-            .expect("set token fixture permissions");
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(&path, "0123456789abcdef0123456789abcdef\n")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
         assert!(load_or_create_token(&path).is_err());
         let _ = std::fs::remove_dir_all(&root);
+        return Ok(());
     }
 }
