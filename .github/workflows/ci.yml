@@ -25,13 +25,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ORESoftware/ores-common-desktop-infra
-          ref: 7720f084155c8c3c92f714873516eb119826c296
+          ref: 981417bc97ef6932a1ce23827386b94cd301a367
           path: tmp/dev/ores-common-desktop-infra
           token: ${{ secrets.FLEET_GITHUB_READ_TOKEN }}
           persist-credentials: false
       - name: Verify pinned common desktop runtime
         shell: bash
-        run: test "$(git -C tmp/dev/ores-common-desktop-infra rev-parse HEAD)" = "7720f084155c8c3c92f714873516eb119826c296"
+        run: test "$(git -C tmp/dev/ores-common-desktop-infra rev-parse HEAD)" = "981417bc97ef6932a1ce23827386b94cd301a367"
       - name: Install declared MSRV
         shell: bash
         run: rustup toolchain install 1.90.0 --profile minimal --component rustfmt,clippy
