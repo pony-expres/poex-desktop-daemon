@@ -245,16 +245,12 @@ async fn invoke(
         ));
     }
 
-    let permit = state
-        .permits
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "fresh Pony worker capacity is exhausted".to_owned(),
-            )
-        })?;
+    let permit = state.permits.clone().try_acquire_owned().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "fresh Pony worker capacity is exhausted".to_owned(),
+        )
+    })?;
     state.accepted.fetch_add(1, Ordering::Relaxed);
 
     let result = run_fresh_worker(&state, &request, Duration::from_millis(timeout_ms)).await;
