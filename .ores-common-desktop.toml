@@ -1,0 +1,13 @@
+schema = "ores.common-desktop-consumer/v1"
+product_id = "pony-expres"
+role = "desktop-daemon"
+runtime_kind = "pony_actor"
+common_repository = "ORESoftware/ores-common-desktop-infra"
+common_revision = "73ebe4b3caa7478c45f64a2eb983838a91ff9732"
+distribution = "zed-pkg"
+package = "oresoftware/ores-common-desktop-infra"
+package_version = "0.1.0"
+common_targets = ["daemon", "runtime", "router", "auth", "artifact-store", "state", "conformance"]
+
+[conformance]
+required = true
