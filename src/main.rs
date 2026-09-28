@@ -11,6 +11,8 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     env,
+    fs::{self, OpenOptions},
+    io::{ErrorKind, Write},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
@@ -33,6 +35,7 @@ const MAX_BODY_BYTES: usize = 256 * 1024;
 const MAX_PARALLELISM: usize = 256;
 const MAX_WORKER_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_WORKER_STDERR_BYTES: usize = 1024 * 1024;
+const MAX_TOKEN_FILE_BYTES: u64 = 4096;
 
 #[allow(non_snake_case)]
 #[derive(Debug, Deserialize)]
@@ -464,33 +467,92 @@ fn expand_home(path: &Path) -> Result<PathBuf> {
     return Ok(path.to_path_buf());
 }
 
-fn load_or_create_token(path: &Path) -> Result<String> {
-    if let Ok(token) = std::fs::read_to_string(path) {
-        let token = token.trim();
-        if token.len() >= 32 && !token.chars().any(char::is_whitespace) {
-            return Ok(token.to_owned());
+fn read_token_file(path: &Path) -> Result<Option<String>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot inspect token file {}", path.display()));
         }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("desktop daemon token path must be a regular non-symlink file");
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_TOKEN_FILE_BYTES {
+        bail!("desktop daemon token file size is invalid");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!("desktop daemon token file must not be accessible by group/other users");
+        }
+    }
+
+    let token = fs::read_to_string(path)
+        .with_context(|| format!("cannot read desktop daemon token file {}", path.display()))?;
+    let token = token.trim();
+    if token.len() < 32 || token.len() > 4096 || token.chars().any(char::is_whitespace) {
         bail!("desktop daemon token file is malformed");
+    }
+    return Ok(Some(token.to_owned()));
+}
+
+fn load_or_create_token(path: &Path) -> Result<String> {
+    if let Some(token) = read_token_file(path)? {
+        return Ok(token);
     }
 
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("token path has no parent"))?;
-    std::fs::create_dir_all(parent)?;
-    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    std::fs::write(path, format!("{token}\n"))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("cannot create token directory {}", parent.display()))?;
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+
+        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        match options.open(path) {
+            Ok(mut file) => {
+                file.write_all(format!("{token}\n").as_bytes())?;
+                file.sync_all()?;
+                return Ok(token);
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                return read_token_file(path)?.ok_or_else(|| {
+                    anyhow!("desktop daemon token file appeared but could not be read")
+                });
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
 
-    return Ok(token);
-}
-
-fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
-    return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
+    #[cfg(not(unix))]
+    {
+        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        match options.open(path) {
+            Ok(mut file) => {
+                file.write_all(format!("{token}\n").as_bytes())?;
+                file.sync_all()?;
+                return Ok(token);
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                return read_token_file(path)?.ok_or_else(|| {
+                    anyhow!("desktop daemon token file appeared but could not be read")
+                });
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 async fn shutdown_signal() {
