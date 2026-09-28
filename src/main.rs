@@ -19,13 +19,20 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{io::AsyncWriteExt, process::Command, sync::Semaphore, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    process::Command,
+    sync::Semaphore,
+    time::timeout,
+};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const MAX_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 const MAX_BODY_BYTES: usize = 256 * 1024;
 const MAX_PARALLELISM: usize = 256;
+const MAX_WORKER_STDOUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_WORKER_STDERR_BYTES: usize = 1024 * 1024;
 
 #[allow(non_snake_case)]
 #[derive(Debug, Deserialize)]
@@ -61,6 +68,7 @@ struct AppState {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InvocationRequest {
     invocation_id: String,
     tenant_id: String,
@@ -89,6 +97,12 @@ struct StatusResponse {
     completed: u64,
     failed: u64,
     available_slots: usize,
+}
+
+#[derive(Debug)]
+struct DrainCapture {
+    bytes: Vec<u8>,
+    exceeded: bool,
 }
 
 #[tokio::main]
@@ -234,9 +248,13 @@ async fn invoke(
     let permit = state
         .permits
         .clone()
-        .acquire_owned()
-        .await
-        .map_err(internal_error)?;
+        .try_acquire_owned()
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "fresh Pony worker capacity is exhausted".to_owned(),
+            )
+        })?;
     state.accepted.fetch_add(1, Ordering::Relaxed);
 
     let result = run_fresh_worker(&state, &request, Duration::from_millis(timeout_ms)).await;
@@ -282,21 +300,46 @@ async fn run_fresh_worker(
         .spawn()
         .with_context(|| format!("failed to start {}", state.worker_command))?;
 
-    let payload = serde_json::to_vec(&request.payload_json)?;
     let mut stdin = child
         .stdin
         .take()
         .ok_or_else(|| anyhow!("worker stdin unavailable"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("worker stdout unavailable"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("worker stderr unavailable"))?;
+
+    let payload = serde_json::to_vec(&request.payload_json)?;
     stdin.write_all(&payload).await?;
     stdin.shutdown().await?;
     drop(stdin);
 
-    let output = timeout(deadline, child.wait_with_output())
+    let execution = async {
+        let (status, stdout_capture, stderr_capture) = tokio::join!(
+            child.wait(),
+            drain_bounded(&mut stdout, MAX_WORKER_STDOUT_BYTES),
+            drain_bounded(&mut stderr, MAX_WORKER_STDERR_BYTES),
+        );
+        return Ok::<_, anyhow::Error>((status?, stdout_capture?, stderr_capture?));
+    };
+
+    let (status, stdout_capture, stderr_capture) = timeout(deadline, execution)
         .await
         .map_err(|_| anyhow!("invocation timed out; fresh worker was terminated"))??;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if stdout_capture.exceeded {
+        bail!("worker stdout exceeded {MAX_WORKER_STDOUT_BYTES} bytes");
+    }
+    if stderr_capture.exceeded {
+        bail!("worker stderr exceeded {MAX_WORKER_STDERR_BYTES} bytes");
+    }
+
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_capture.bytes);
         let summary = stderr
             .lines()
             .find(|line| !line.trim().is_empty())
@@ -304,9 +347,36 @@ async fn run_fresh_worker(
         bail!("worker failed: {}", truncate(summary, 512));
     }
 
-    let stdout = String::from_utf8(output.stdout).context("worker stdout was not UTF-8")?;
+    let stdout = String::from_utf8(stdout_capture.bytes).context("worker stdout was not UTF-8")?;
     let payload_json = serde_json::from_str(stdout.trim()).context("worker stdout was not JSON")?;
     return Ok(payload_json);
+}
+
+async fn drain_bounded<R>(reader: &mut R, max_bytes: usize) -> Result<DrainCapture>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    let mut exceeded = false;
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+
+        let remaining = max_bytes.saturating_sub(bytes.len());
+        let retained = remaining.min(read);
+        if retained > 0 {
+            bytes.extend_from_slice(&buffer[..retained]);
+        }
+        if read > retained {
+            exceeded = true;
+        }
+    }
+
+    return Ok(DrainCapture { bytes, exceeded });
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {
@@ -452,5 +522,23 @@ mod tests {
     fn truncates_worker_errors() {
         let value = "x".repeat(1024);
         assert_eq!(truncate(&value, 512).len(), 512);
+    }
+
+    #[tokio::test]
+    async fn bounded_drain_keeps_draining_after_limit() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let write = tokio::spawn(async move {
+            writer.write_all(b"0123456789abcdef").await?;
+            writer.shutdown().await?;
+            return Ok::<_, std::io::Error>(());
+        });
+
+        let capture = drain_bounded(&mut reader, 8).await;
+        assert!(capture.is_ok());
+        if let Ok(capture) = capture {
+            assert_eq!(capture.bytes, b"01234567");
+            assert!(capture.exceeded);
+        }
+        assert!(write.await.is_ok());
     }
 }
