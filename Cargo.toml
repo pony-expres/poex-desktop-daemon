@@ -8,12 +8,19 @@ description = "Loopback desktop control plane for Pony Expres"
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+ores-common-desktop-auth = { git = "https://github.com/ORESoftware/ores-common-desktop-infra.git", rev = "0fe05c9a62622564b43354c06612815e50241650" }
+ores-common-desktop-router = { git = "https://github.com/ORESoftware/ores-common-desktop-infra.git", rev = "0fe05c9a62622564b43354c06612815e50241650" }
+ores-common-desktop-runtime = { git = "https://github.com/ORESoftware/ores-common-desktop-infra.git", rev = "0fe05c9a62622564b43354c06612815e50241650" }
+ores-common-desktop-state = { git = "https://github.com/ORESoftware/ores-common-desktop-infra.git", rev = "0fe05c9a62622564b43354c06612815e50241650" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+ores-common-desktop-conformance = { git = "https://github.com/ORESoftware/ores-common-desktop-infra.git", rev = "0fe05c9a62622564b43354c06612815e50241650" }
 
 [lints.rust]
 unsafe_code = "deny"
