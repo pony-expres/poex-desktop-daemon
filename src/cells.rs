@@ -179,7 +179,9 @@ impl CellPool {
         }
 
         if cell.draining.load(Ordering::Acquire) && cell.active.load(Ordering::Acquire) == 0 {
-            let _ = self.retire(&key.tenant_id, &key.deployment_id, cell.index).await;
+            let _ = self
+                .retire(&key.tenant_id, &key.deployment_id, cell.index)
+                .await;
         }
 
         return result;
