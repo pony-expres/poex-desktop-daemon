@@ -24,12 +24,15 @@ jobs:
       - name: Install declared MSRV
         shell: bash
         run: rustup toolchain install 1.90.0 --profile minimal --component rustfmt,clippy
+      - name: Verify committed lockfile
+        shell: bash
+        run: test -f Cargo.lock
       - name: Format
         shell: bash
         run: cargo +1.90.0 fmt --all -- --check
       - name: Clippy
         shell: bash
-        run: cargo +1.90.0 clippy --all-targets -- -D warnings
+        run: cargo +1.90.0 clippy --locked --all-targets -- -D warnings
       - name: Test
         shell: bash
-        run: cargo +1.90.0 test --all-targets
+        run: cargo +1.90.0 test --locked --all-targets
