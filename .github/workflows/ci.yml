@@ -6,10 +6,43 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
+  materialize-lock:
+    if: github.event_name == 'pull_request' && github.head_ref == 'alexanderdmills/den-3045-lockfile'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out review branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.head_ref }}
+          persist-credentials: true
+      - name: Install declared MSRV
+        shell: bash
+        run: rustup toolchain install 1.90.0 --profile minimal
+      - name: Materialize and verify reviewed lockfile
+        shell: bash
+        env:
+          EXPECTED_LOCK_SHA256: 85dc4311fee5a9334fdae1dbe7193bb8a49b4a42ad149ac204dd0a3bc4bba4ae
+        run: |
+          cargo +1.90.0 generate-lockfile
+          test "$(sha256sum Cargo.lock | awk '{print $1}')" = "$EXPECTED_LOCK_SHA256"
+      - name: Commit exact reviewed lockfile if absent
+        shell: bash
+        run: |
+          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.lock
+          git commit -m 'build: commit deterministic Cargo.lock'
+          git push origin "HEAD:${GITHUB_HEAD_REF}"
+
   rust:
+    needs: materialize-lock
     strategy:
       fail-fast: false
       matrix:
@@ -24,17 +57,9 @@ jobs:
       - name: Install declared MSRV
         shell: bash
         run: rustup toolchain install 1.90.0 --profile minimal --component rustfmt,clippy
-      - name: Generate deterministic lockfile candidate
+      - name: Verify committed lockfile
         shell: bash
-        run: cargo +1.90.0 generate-lockfile
-      - name: Retain generated lockfile candidate
-        if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: poex-desktop-daemon-cargo-lock-${{ github.event.pull_request.head.sha || github.sha }}
-          path: Cargo.lock
-          if-no-files-found: error
-          retention-days: 7
+        run: test -f Cargo.lock
       - name: Format
         shell: bash
         run: cargo +1.90.0 fmt --all -- --check
