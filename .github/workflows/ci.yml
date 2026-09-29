@@ -27,12 +27,12 @@ jobs:
       - name: Verify committed lockfile
         shell: bash
         run: test -f Cargo.lock
-      - name: Format
-        shell: bash
-        run: cargo +1.90.0 fmt --all -- --check
       - name: Clippy
         shell: bash
         run: cargo +1.90.0 clippy --locked --all-targets -- -D warnings
       - name: Test
         shell: bash
         run: cargo +1.90.0 test --locked --all-targets
+      - name: Format
+        shell: bash
+        run: cargo +1.90.0 fmt --all -- --check

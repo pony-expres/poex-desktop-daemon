@@ -1,13 +1,16 @@
+mod cells;
+
 use anyhow::{Context as _, Result, anyhow, bail};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
+use cells::{CellPool, CellPoolConfig, CellStatus};
 use flags2env::BundledFlags2Env;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     env,
@@ -19,22 +22,21 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::Command,
-    sync::Semaphore,
-    time::timeout,
-};
+use tokio::sync::Semaphore;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const MAX_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 const MAX_BODY_BYTES: usize = 256 * 1024;
-const MAX_PARALLELISM: usize = 256;
-const MAX_WORKER_STDOUT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_WORKER_STDERR_BYTES: usize = 1024 * 1024;
+const MAX_PARALLELISM: usize = 4096;
+const MAX_LIVE_CELLS: usize = 4096;
+const MAX_CELLS_PER_GENERATION: usize = 64;
+const MAX_CELL_CONCURRENCY: usize = 1024;
+const MAX_CELL_INVOCATIONS: u64 = 10_000_000;
+const MAX_CELL_IDLE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const MAX_CELL_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const MAX_TOKEN_FILE_BYTES: u64 = 4096;
 
 #[allow(non_snake_case)]
@@ -43,7 +45,14 @@ struct CliConfig {
     POEX_DESKTOP_ADDR: String,
     POEX_WORKER_COMMAND: String,
     POEX_WORKER_ARGS_JSON: String,
+    POEX_ARTIFACT_ROOT: Option<String>,
     POEX_MAX_PARALLEL_INVOCATIONS: i64,
+    POEX_MAX_LIVE_CELLS: i64,
+    POEX_MAX_CELLS_PER_GENERATION: i64,
+    POEX_MAX_CELL_CONCURRENCY: i64,
+    POEX_MAX_CELL_INVOCATIONS: i64,
+    POEX_CELL_IDLE_TTL_MS: i64,
+    POEX_MAX_CELL_AGE_MS: i64,
     POEX_DESKTOP_TOKEN_FILE: Option<String>,
     POEX_DESKTOP_LOG: String,
 }
@@ -53,7 +62,14 @@ struct RuntimeConfig {
     addr: SocketAddr,
     worker_command: String,
     worker_args: Vec<String>,
+    artifact_root: PathBuf,
     parallelism: usize,
+    max_live_cells: usize,
+    max_cells_per_generation: usize,
+    max_cell_concurrency: usize,
+    max_cell_invocations: u64,
+    cell_idle_ttl: Duration,
+    max_cell_age: Duration,
     token_path: PathBuf,
     log_filter: String,
 }
@@ -61,10 +77,9 @@ struct RuntimeConfig {
 #[derive(Clone)]
 struct AppState {
     token: Arc<str>,
-    worker_command: Arc<str>,
-    worker_args: Arc<Vec<String>>,
     permits: Arc<Semaphore>,
-    started_at: Instant,
+    cells: CellPool,
+    started_at: std::time::Instant,
     accepted: Arc<AtomicU64>,
     completed: Arc<AtomicU64>,
     failed: Arc<AtomicU64>,
@@ -94,18 +109,20 @@ struct StatusResponse {
     runtime: &'static str,
     actor_reusable: bool,
     worker_mode: &'static str,
+    cell_reuse_scope: &'static str,
+    security_boundary: &'static str,
+    request_protocol: &'static str,
     config_source: &'static str,
     uptime_ms: u128,
     accepted: u64,
     completed: u64,
     failed: u64,
-    available_slots: usize,
-}
-
-#[derive(Debug)]
-struct DrainCapture {
-    bytes: Vec<u8>,
-    exceeded: bool,
+    live_cells: usize,
+    available_invocation_slots: usize,
+    available_cell_slots: usize,
+    max_cells_per_generation: usize,
+    max_cell_concurrency: usize,
+    max_cell_invocations: u64,
 }
 
 #[tokio::main]
@@ -116,12 +133,24 @@ async fn main() -> Result<()> {
         .init();
 
     let token = load_or_create_token(&config.token_path)?;
+    let cells = CellPool::new(CellPoolConfig {
+        worker_command: config.worker_command,
+        worker_args: config.worker_args,
+        artifact_root: config.artifact_root,
+        max_live_cells: config.max_live_cells,
+        max_cells_per_generation: config.max_cells_per_generation,
+        max_cell_concurrency: config.max_cell_concurrency,
+        max_cell_invocations: config.max_cell_invocations,
+        cell_idle_ttl: config.cell_idle_ttl,
+        max_cell_age: config.max_cell_age,
+    });
+    cells.start_reaper();
+
     let state = AppState {
         token: Arc::from(token),
-        worker_command: Arc::from(config.worker_command),
-        worker_args: Arc::new(config.worker_args),
         permits: Arc::new(Semaphore::new(config.parallelism)),
-        started_at: Instant::now(),
+        cells,
+        started_at: std::time::Instant::now(),
         accepted: Arc::new(AtomicU64::new(0)),
         completed: Arc::new(AtomicU64::new(0)),
         failed: Arc::new(AtomicU64::new(0)),
@@ -131,15 +160,25 @@ async fn main() -> Result<()> {
         .route("/healthz", get(health))
         .route("/v1/status", get(status))
         .route("/v1/doctor", get(status))
+        .route("/v1/cells", get(list_cells))
+        .route(
+            "/v1/cells/{tenant_id}/{deployment_id}/{cell_index}/drain",
+            post(drain_cell_route),
+        )
+        .route(
+            "/v1/cells/{tenant_id}/{deployment_id}/{cell_index}/retire",
+            post(retire_cell_route),
+        )
         .route("/v1/invoke", post(invoke))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(config.addr).await?;
     tracing::info!(addr = %config.addr, "pony desktop daemon listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    state.cells.shutdown().await;
     return Ok(());
 }
 
@@ -187,12 +226,45 @@ fn load_config() -> Result<RuntimeConfig> {
         bail!("worker argument vector exceeds desktop limits");
     }
 
-    let parallelism = usize::try_from(raw_config.POEX_MAX_PARALLEL_INVOCATIONS)
-        .ok()
-        .filter(|value| *value > 0 && *value <= MAX_PARALLELISM)
-        .ok_or_else(|| {
-            anyhow!("POEX_MAX_PARALLEL_INVOCATIONS must be between 1 and {MAX_PARALLELISM}")
-        })?;
+    let artifact_root = match raw_config.POEX_ARTIFACT_ROOT {
+        Some(path) if !path.trim().is_empty() => expand_home(Path::new(&path))?,
+        _ => default_artifact_root()?,
+    };
+    let parallelism = bounded_usize(
+        "POEX_MAX_PARALLEL_INVOCATIONS",
+        raw_config.POEX_MAX_PARALLEL_INVOCATIONS,
+        MAX_PARALLELISM,
+    )?;
+    let max_live_cells = bounded_usize(
+        "POEX_MAX_LIVE_CELLS",
+        raw_config.POEX_MAX_LIVE_CELLS,
+        MAX_LIVE_CELLS,
+    )?;
+    let max_cells_per_generation = bounded_usize(
+        "POEX_MAX_CELLS_PER_GENERATION",
+        raw_config.POEX_MAX_CELLS_PER_GENERATION,
+        MAX_CELLS_PER_GENERATION,
+    )?;
+    let max_cell_concurrency = bounded_usize(
+        "POEX_MAX_CELL_CONCURRENCY",
+        raw_config.POEX_MAX_CELL_CONCURRENCY,
+        MAX_CELL_CONCURRENCY,
+    )?;
+    let max_cell_invocations = bounded_u64(
+        "POEX_MAX_CELL_INVOCATIONS",
+        raw_config.POEX_MAX_CELL_INVOCATIONS,
+        MAX_CELL_INVOCATIONS,
+    )?;
+    let cell_idle_ttl_ms = bounded_u64(
+        "POEX_CELL_IDLE_TTL_MS",
+        raw_config.POEX_CELL_IDLE_TTL_MS,
+        MAX_CELL_IDLE_TTL_MS,
+    )?;
+    let max_cell_age_ms = bounded_u64(
+        "POEX_MAX_CELL_AGE_MS",
+        raw_config.POEX_MAX_CELL_AGE_MS,
+        MAX_CELL_AGE_MS,
+    )?;
     let token_path = match raw_config.POEX_DESKTOP_TOKEN_FILE {
         Some(path) if !path.trim().is_empty() => expand_home(Path::new(&path))?,
         _ => default_token_path()?,
@@ -202,10 +274,33 @@ fn load_config() -> Result<RuntimeConfig> {
         addr,
         worker_command,
         worker_args,
+        artifact_root,
         parallelism,
+        max_live_cells,
+        max_cells_per_generation,
+        max_cell_concurrency,
+        max_cell_invocations,
+        cell_idle_ttl: Duration::from_millis(cell_idle_ttl_ms),
+        max_cell_age: Duration::from_millis(max_cell_age_ms),
         token_path,
         log_filter: raw_config.POEX_DESKTOP_LOG,
     });
+}
+
+fn bounded_usize(name: &str, value: i64, maximum: usize) -> Result<usize> {
+    let value = usize::try_from(value)
+        .ok()
+        .filter(|value| *value > 0 && *value <= maximum)
+        .ok_or_else(|| anyhow!("{name} must be between 1 and {maximum}"))?;
+    return Ok(value);
+}
+
+fn bounded_u64(name: &str, value: i64, maximum: u64) -> Result<u64> {
+    let value = u64::try_from(value)
+        .ok()
+        .filter(|value| *value > 0 && *value <= maximum)
+        .ok_or_else(|| anyhow!("{name} must be between 1 and {maximum}"))?;
+    return Ok(value);
 }
 
 async fn health() -> &'static str {
@@ -220,14 +315,60 @@ async fn status(
     return Ok(Json(StatusResponse {
         runtime: "pony_native",
         actor_reusable: false,
-        worker_mode: "fresh_process",
+        worker_mode: "warm_tenant_generation_cells",
+        cell_reuse_scope: "same_tenant_generation",
+        security_boundary: "os_process",
+        request_protocol: "u32be_length_prefixed_json_v1",
         config_source: "flags-2-env",
         uptime_ms: state.started_at.elapsed().as_millis(),
         accepted: state.accepted.load(Ordering::Relaxed),
         completed: state.completed.load(Ordering::Relaxed),
         failed: state.failed.load(Ordering::Relaxed),
-        available_slots: state.permits.available_permits(),
+        live_cells: state.cells.live_cells().await,
+        available_invocation_slots: state.permits.available_permits(),
+        available_cell_slots: state.cells.available_cell_slots(),
+        max_cells_per_generation: state.cells.max_cells_per_generation(),
+        max_cell_concurrency: state.cells.max_cell_concurrency(),
+        max_cell_invocations: state.cells.max_cell_invocations(),
     }));
+}
+
+async fn list_cells(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<CellStatus>>, (StatusCode, String)> {
+    authorize(&headers, &state)?;
+    return Ok(Json(state.cells.statuses().await));
+}
+
+async fn drain_cell_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((tenant_id, deployment_id, cell_index)): AxumPath<(String, String, u32)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    authorize(&headers, &state)?;
+    validate_identifier("tenant_id", &tenant_id)?;
+    validate_identifier("deployment_id", &deployment_id)?;
+    let draining = state
+        .cells
+        .drain(&tenant_id, &deployment_id, cell_index)
+        .await;
+    return Ok(Json(json!({ "draining": draining })));
+}
+
+async fn retire_cell_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((tenant_id, deployment_id, cell_index)): AxumPath<(String, String, u32)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    authorize(&headers, &state)?;
+    validate_identifier("tenant_id", &tenant_id)?;
+    validate_identifier("deployment_id", &deployment_id)?;
+    let retired = state
+        .cells
+        .retire(&tenant_id, &deployment_id, cell_index)
+        .await;
+    return Ok(Json(json!({ "retired": retired })));
 }
 
 async fn invoke(
@@ -248,16 +389,24 @@ async fn invoke(
         ));
     }
 
-    let permit = state.permits.clone().try_acquire_owned().map_err(|_| {
+    let _permit = state.permits.clone().try_acquire_owned().map_err(|_| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "fresh Pony worker capacity is exhausted".to_owned(),
+            "Pony invocation capacity is exhausted".to_owned(),
         )
     })?;
     state.accepted.fetch_add(1, Ordering::Relaxed);
 
-    let result = run_fresh_worker(&state, &request, Duration::from_millis(timeout_ms)).await;
-    drop(permit);
+    let result = state
+        .cells
+        .invoke(
+            &request.tenant_id,
+            &request.deployment_id,
+            &request.invocation_id,
+            &request.payload_json,
+            Duration::from_millis(timeout_ms),
+        )
+        .await;
     state.completed.fetch_add(1, Ordering::Relaxed);
     if result.is_err() {
         state.failed.fetch_add(1, Ordering::Relaxed);
@@ -279,107 +428,7 @@ async fn invoke(
             error: Some(error.to_string()),
         },
     };
-
     return Ok(Json(response));
-}
-
-async fn run_fresh_worker(
-    state: &AppState,
-    request: &InvocationRequest,
-    deadline: Duration,
-) -> Result<Value> {
-    let mut child = Command::new(state.worker_command.as_ref())
-        .args(state.worker_args.iter())
-        .env("POEX_TENANT_ID", &request.tenant_id)
-        .env("POEX_DEPLOYMENT_ID", &request.deployment_id)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("failed to start {}", state.worker_command))?;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("worker stdin unavailable"))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("worker stdout unavailable"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("worker stderr unavailable"))?;
-
-    let payload = serde_json::to_vec(&request.payload_json)?;
-    stdin.write_all(&payload).await?;
-    stdin.shutdown().await?;
-    drop(stdin);
-
-    let execution = async {
-        let (status, stdout_capture, stderr_capture) = tokio::join!(
-            child.wait(),
-            drain_bounded(&mut stdout, MAX_WORKER_STDOUT_BYTES),
-            drain_bounded(&mut stderr, MAX_WORKER_STDERR_BYTES),
-        );
-        return Ok::<_, anyhow::Error>((status?, stdout_capture?, stderr_capture?));
-    };
-
-    let (status, stdout_capture, stderr_capture) = timeout(deadline, execution)
-        .await
-        .map_err(|_| anyhow!("invocation timed out; fresh worker was terminated"))??;
-
-    if stdout_capture.exceeded {
-        bail!("worker stdout exceeded {MAX_WORKER_STDOUT_BYTES} bytes");
-    }
-    if stderr_capture.exceeded {
-        bail!("worker stderr exceeded {MAX_WORKER_STDERR_BYTES} bytes");
-    }
-
-    if !status.success() {
-        let stderr = String::from_utf8_lossy(&stderr_capture.bytes);
-        let summary = stderr
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("worker exited unsuccessfully");
-        bail!("worker failed: {}", truncate(summary, 512));
-    }
-
-    let stdout = String::from_utf8(stdout_capture.bytes).context("worker stdout was not UTF-8")?;
-    let payload_json = serde_json::from_str(stdout.trim()).context("worker stdout was not JSON")?;
-    return Ok(payload_json);
-}
-
-async fn drain_bounded<R>(reader: &mut R, max_bytes: usize) -> Result<DrainCapture>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
-    let mut exceeded = false;
-    let mut buffer = [0_u8; 8192];
-
-    loop {
-        let read = reader.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-
-        let remaining = max_bytes.saturating_sub(bytes.len());
-        let retained = remaining.min(read);
-        if retained > 0 {
-            bytes.extend_from_slice(&buffer[..retained]);
-        }
-        if read > retained {
-            exceeded = true;
-        }
-    }
-
-    return Ok(DrainCapture { bytes, exceeded });
-}
-
-fn truncate(value: &str, max_chars: usize) -> String {
-    return value.chars().take(max_chars).collect();
 }
 
 fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
@@ -453,6 +502,13 @@ fn default_token_path() -> Result<PathBuf> {
         .or_else(|| env::var_os("USERPROFILE"))
         .ok_or_else(|| anyhow!("HOME or USERPROFILE is required"))?;
     return Ok(PathBuf::from(home).join(".pony-expres/daemon/token"));
+}
+
+fn default_artifact_root() -> Result<PathBuf> {
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .ok_or_else(|| anyhow!("HOME or USERPROFILE is required"))?;
+    return Ok(PathBuf::from(home).join(".pony-expres/artifacts"));
 }
 
 fn expand_home(path: &Path) -> Result<PathBuf> {
@@ -577,26 +633,10 @@ mod tests {
     }
 
     #[test]
-    fn truncates_worker_errors() {
-        let value = "x".repeat(1024);
-        assert_eq!(truncate(&value, 512).len(), 512);
-    }
-
-    #[tokio::test]
-    async fn bounded_drain_keeps_draining_after_limit() {
-        let (mut writer, mut reader) = tokio::io::duplex(64);
-        let write = tokio::spawn(async move {
-            writer.write_all(b"0123456789abcdef").await?;
-            writer.shutdown().await?;
-            return Ok::<_, std::io::Error>(());
-        });
-
-        let capture = drain_bounded(&mut reader, 8).await;
-        assert!(capture.is_ok());
-        if let Ok(capture) = capture {
-            assert_eq!(capture.bytes, b"01234567");
-            assert!(capture.exceeded);
-        }
-        assert!(write.await.is_ok());
+    fn numeric_limits_are_bounded() {
+        assert_eq!(bounded_usize("x", 4, 8).ok(), Some(4));
+        assert!(bounded_usize("x", 0, 8).is_err());
+        assert!(bounded_usize("x", 9, 8).is_err());
+        assert_eq!(bounded_u64("x", 4, 8).ok(), Some(4));
     }
 }
