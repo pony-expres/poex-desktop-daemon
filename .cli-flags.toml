@@ -18,7 +18,7 @@ env = "POEX_WORKER_COMMAND"
 aliases = ["worker"]
 type = "string"
 default = "poex-lambda"
-help = "Allowlisted Pony worker executable selected by local desktop desired state."
+help = "Development/fallback Pony worker executable. Production deployments should use POEX_ARTIFACT_ROOT."
 
 [flags.worker-args-json]
 env = "POEX_WORKER_ARGS_JSON"
@@ -27,19 +27,39 @@ type = "string"
 default = "[]"
 help = "JSON string array of fixed worker arguments. API callers cannot override these arguments."
 
+[flags.artifact-root]
+env = "POEX_ARTIFACT_ROOT"
+aliases = ["artifact-root"]
+type = "string"
+help = "Optional immutable artifact root. Workers resolve as <root>/<tenant>/<deployment>/lambda."
+
 [flags.max-parallel]
 env = "POEX_MAX_PARALLEL_INVOCATIONS"
 aliases = ["max-parallel"]
 type = "integer"
-default = 8
-help = "Maximum concurrent invocations across warm tenant process pools."
+default = 32
+help = "Maximum concurrent invocations admitted by this daemon."
 
 [flags.tenant-pool-size]
 env = "POEX_TENANT_POOL_SIZE"
 aliases = ["tenant-pool-size"]
 type = "integer"
 default = 3
-help = "Warm OS processes per tenant+deployment generation on this box."
+help = "Warm OS process cells per tenant+deployment generation on this box."
+
+[flags.max-live-cells]
+env = "POEX_MAX_LIVE_CELLS"
+aliases = ["max-live-cells"]
+type = "integer"
+default = 64
+help = "Maximum simultaneously resident Pony process cells across all tenants and generations."
+
+[flags.max-cell-invocations]
+env = "POEX_MAX_CELL_INVOCATIONS"
+aliases = ["max-cell-invocations"]
+type = "integer"
+default = 10000
+help = "Retire a tenant generation pool after any process cell reaches this invocation count."
 
 [flags.token-file]
 env = "POEX_DESKTOP_TOKEN_FILE"
