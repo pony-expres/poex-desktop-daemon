@@ -34,6 +34,13 @@ type = "integer"
 default = 8
 help = "Maximum concurrent invocations across warm tenant process pools."
 
+[flags.tenant-pool-size]
+env = "POEX_TENANT_POOL_SIZE"
+aliases = ["tenant-pool-size"]
+type = "integer"
+default = 3
+help = "Warm OS processes per tenant+deployment generation on this box."
+
 [flags.token-file]
 env = "POEX_DESKTOP_TOKEN_FILE"
 aliases = ["token-file"]
