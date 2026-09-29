@@ -640,3 +640,5 @@ mod tests {
         assert_eq!(bounded_u64("x", 4, 8).ok(), Some(4));
     }
 }
+
+// rustfmt EOF sentinel
