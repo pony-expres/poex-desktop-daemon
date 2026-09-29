@@ -18,28 +18,70 @@ env = "POEX_WORKER_COMMAND"
 aliases = ["worker"]
 type = "string"
 default = "poex-lambda"
-help = "Allowlisted Pony worker executable selected by local desktop desired state."
+help = "Development fallback Pony worker. Immutable tenant deployment artifacts are preferred when present."
 
 [flags.worker-args-json]
 env = "POEX_WORKER_ARGS_JSON"
 aliases = ["worker-args-json"]
 type = "string"
 default = "[]"
-help = "JSON string array of fixed worker arguments. API callers cannot override these arguments."
+help = "JSON string array of fixed fallback-worker arguments. API callers cannot override these arguments."
+
+[flags.artifact-root]
+env = "POEX_ARTIFACT_ROOT"
+aliases = ["artifact-root"]
+type = "string"
+default = "~/.pony-expres/artifacts"
+help = "Root containing immutable <tenant>/<deployment>/lambda Pony executables."
 
 [flags.max-parallel]
 env = "POEX_MAX_PARALLEL_INVOCATIONS"
 aliases = ["max-parallel"]
 type = "integer"
-default = 8
-help = "Maximum concurrent invocations across warm tenant process pools."
+default = 256
+help = "Maximum concurrent invocations admitted by this daemon across all warm cells."
 
-[flags.tenant-pool-size]
-env = "POEX_TENANT_POOL_SIZE"
-aliases = ["tenant-pool-size"]
+[flags.max-live-cells]
+env = "POEX_MAX_LIVE_CELLS"
+aliases = ["max-live-cells"]
 type = "integer"
-default = 3
-help = "Warm OS processes per tenant+deployment generation on this box."
+default = 1024
+help = "Maximum warm Pony OS-process cells on this machine."
+
+[flags.max-cells-per-generation]
+env = "POEX_MAX_CELLS_PER_GENERATION"
+aliases = ["max-cells-per-generation"]
+type = "integer"
+default = 4
+help = "Maximum warm OS-process cells for one tenant+deployment generation."
+
+[flags.max-cell-concurrency]
+env = "POEX_MAX_CELL_CONCURRENCY"
+aliases = ["max-cell-concurrency"]
+type = "integer"
+default = 32
+help = "Maximum concurrent fresh invocation actors admitted to one warm Pony cell."
+
+[flags.max-cell-invocations]
+env = "POEX_MAX_CELL_INVOCATIONS"
+aliases = ["max-cell-invocations"]
+type = "integer"
+default = 100000
+help = "Drain and recycle a Pony cell after this many admitted invocations."
+
+[flags.cell-idle-ttl-ms]
+env = "POEX_CELL_IDLE_TTL_MS"
+aliases = ["cell-idle-ttl-ms"]
+type = "integer"
+default = 300000
+help = "Retire an idle warm Pony cell after this many milliseconds."
+
+[flags.max-cell-age-ms]
+env = "POEX_MAX_CELL_AGE_MS"
+aliases = ["max-cell-age-ms"]
+type = "integer"
+default = 3600000
+help = "Recycle a warm Pony cell after this maximum age in milliseconds."
 
 [flags.token-file]
 env = "POEX_DESKTOP_TOKEN_FILE"
