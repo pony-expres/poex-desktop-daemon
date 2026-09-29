@@ -615,3 +615,5 @@ mod tests {
         assert!(decode_worker_frame(frame).is_err());
     }
 }
+
+// rustfmt EOF sentinel
