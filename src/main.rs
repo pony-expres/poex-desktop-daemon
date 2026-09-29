@@ -1,13 +1,16 @@
+mod cells;
+
 use anyhow::{Context as _, Result, anyhow, bail};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
+use cells::{CellPool, CellPoolConfig, CellStatus};
 use flags2env::BundledFlags2Env;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     env,
@@ -19,22 +22,21 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex, Semaphore},
-    time::timeout,
-};
+use tokio::sync::Semaphore;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const MAX_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 const MAX_BODY_BYTES: usize = 256 * 1024;
-const MAX_PARALLELISM: usize = 256;
-const MAX_WORKER_STDOUT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_WORKER_STDERR_BYTES: usize = 1024 * 1024;
+const MAX_PARALLELISM: usize = 4096;
+const MAX_LIVE_CELLS: usize = 4096;
+const MAX_CELLS_PER_GENERATION: usize = 64;
+const MAX_CELL_CONCURRENCY: usize = 1024;
+const MAX_CELL_INVOCATIONS: u64 = 10_000_000;
+const MAX_CELL_IDLE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const MAX_CELL_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const MAX_TOKEN_FILE_BYTES: u64 = 4096;
 
 #[allow(non_snake_case)]
@@ -43,7 +45,14 @@ struct CliConfig {
     POEX_DESKTOP_ADDR: String,
     POEX_WORKER_COMMAND: String,
     POEX_WORKER_ARGS_JSON: String,
-    POEX_MAX_PARALLEL_INVOCATIONS: i64,\n    POEX_TENANT_POOL_SIZE: i64,
+    POEX_ARTIFACT_ROOT: Option<String>,
+    POEX_MAX_PARALLEL_INVOCATIONS: i64,
+    POEX_MAX_LIVE_CELLS: i64,
+    POEX_MAX_CELLS_PER_GENERATION: i64,
+    POEX_MAX_CELL_CONCURRENCY: i64,
+    POEX_MAX_CELL_INVOCATIONS: i64,
+    POEX_CELL_IDLE_TTL_MS: i64,
+    POEX_MAX_CELL_AGE_MS: i64,
     POEX_DESKTOP_TOKEN_FILE: Option<String>,
     POEX_DESKTOP_LOG: String,
 }
@@ -53,7 +62,14 @@ struct RuntimeConfig {
     addr: SocketAddr,
     worker_command: String,
     worker_args: Vec<String>,
-    parallelism: usize,\n    pool_size: usize,
+    artifact_root: PathBuf,
+    parallelism: usize,
+    max_live_cells: usize,
+    max_cells_per_generation: usize,
+    max_cell_concurrency: usize,
+    max_cell_invocations: u64,
+    cell_idle_ttl: Duration,
+    max_cell_age: Duration,
     token_path: PathBuf,
     log_filter: String,
 }
@@ -61,10 +77,9 @@ struct RuntimeConfig {
 #[derive(Clone)]
 struct AppState {
     token: Arc<str>,
-    worker_command: Arc<str>,
-    worker_args: Arc<Vec<String>>,
-    permits: Arc<Semaphore>,\n    pools: Arc<Mutex<HashMap<CellKey, Arc<CellPool>>>>,\n    pool_size: usize,
-    started_at: Instant,
+    permits: Arc<Semaphore>,
+    cells: CellPool,
+    started_at: std::time::Instant,
     accepted: Arc<AtomicU64>,
     completed: Arc<AtomicU64>,
     failed: Arc<AtomicU64>,
@@ -89,41 +104,25 @@ struct InvocationResponse {
     error: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct CellKey {
-    tenant_id: String,
-    deployment_id: String,
-}
-
-struct Cell {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    invocation_count: u64,
-}
-
-struct CellPool {
-    cells: Vec<Arc<Mutex<Cell>>>,
-    next: AtomicU64,
-}
-
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     runtime: &'static str,
     actor_reusable: bool,
     worker_mode: &'static str,
+    cell_reuse_scope: &'static str,
+    security_boundary: &'static str,
+    request_protocol: &'static str,
     config_source: &'static str,
     uptime_ms: u128,
     accepted: u64,
     completed: u64,
     failed: u64,
-    available_slots: usize,\n    tenant_pool_size: usize,\n    live_generation_pools: usize,
-}
-
-#[derive(Debug)]
-struct DrainCapture {
-    bytes: Vec<u8>,
-    exceeded: bool,
+    live_cells: usize,
+    available_invocation_slots: usize,
+    available_cell_slots: usize,
+    max_cells_per_generation: usize,
+    max_cell_concurrency: usize,
+    max_cell_invocations: u64,
 }
 
 #[tokio::main]
@@ -134,14 +133,24 @@ async fn main() -> Result<()> {
         .init();
 
     let token = load_or_create_token(&config.token_path)?;
+    let cells = CellPool::new(CellPoolConfig {
+        worker_command: config.worker_command,
+        worker_args: config.worker_args,
+        artifact_root: config.artifact_root,
+        max_live_cells: config.max_live_cells,
+        max_cells_per_generation: config.max_cells_per_generation,
+        max_cell_concurrency: config.max_cell_concurrency,
+        max_cell_invocations: config.max_cell_invocations,
+        cell_idle_ttl: config.cell_idle_ttl,
+        max_cell_age: config.max_cell_age,
+    });
+    cells.start_reaper();
+
     let state = AppState {
         token: Arc::from(token),
-        worker_command: Arc::from(config.worker_command),
-        worker_args: Arc::new(config.worker_args),
         permits: Arc::new(Semaphore::new(config.parallelism)),
-        pools: Arc::new(Mutex::new(HashMap::new())),
-        pool_size: config.pool_size,
-        started_at: Instant::now(),
+        cells,
+        started_at: std::time::Instant::now(),
         accepted: Arc::new(AtomicU64::new(0)),
         completed: Arc::new(AtomicU64::new(0)),
         failed: Arc::new(AtomicU64::new(0)),
@@ -151,15 +160,25 @@ async fn main() -> Result<()> {
         .route("/healthz", get(health))
         .route("/v1/status", get(status))
         .route("/v1/doctor", get(status))
+        .route("/v1/cells", get(list_cells))
+        .route(
+            "/v1/cells/{tenant_id}/{deployment_id}/{cell_index}/drain",
+            post(drain_cell_route),
+        )
+        .route(
+            "/v1/cells/{tenant_id}/{deployment_id}/{cell_index}/retire",
+            post(retire_cell_route),
+        )
         .route("/v1/invoke", post(invoke))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(config.addr).await?;
     tracing::info!(addr = %config.addr, "pony desktop daemon listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    state.cells.shutdown().await;
     return Ok(());
 }
 
@@ -207,16 +226,45 @@ fn load_config() -> Result<RuntimeConfig> {
         bail!("worker argument vector exceeds desktop limits");
     }
 
-    let parallelism = usize::try_from(raw_config.POEX_MAX_PARALLEL_INVOCATIONS)
-        .ok()
-        .filter(|value| *value > 0 && *value <= MAX_PARALLELISM)
-        .ok_or_else(|| {
-            anyhow!("POEX_MAX_PARALLEL_INVOCATIONS must be between 1 and {MAX_PARALLELISM}")
-        })?;
-    let pool_size = usize::try_from(raw_config.POEX_TENANT_POOL_SIZE)
-        .ok()
-        .filter(|value| *value > 0 && *value <= 16)
-        .ok_or_else(|| anyhow!("POEX_TENANT_POOL_SIZE must be between 1 and 16"))?;
+    let artifact_root = match raw_config.POEX_ARTIFACT_ROOT {
+        Some(path) if !path.trim().is_empty() => expand_home(Path::new(&path))?,
+        _ => default_artifact_root()?,
+    };
+    let parallelism = bounded_usize(
+        "POEX_MAX_PARALLEL_INVOCATIONS",
+        raw_config.POEX_MAX_PARALLEL_INVOCATIONS,
+        MAX_PARALLELISM,
+    )?;
+    let max_live_cells = bounded_usize(
+        "POEX_MAX_LIVE_CELLS",
+        raw_config.POEX_MAX_LIVE_CELLS,
+        MAX_LIVE_CELLS,
+    )?;
+    let max_cells_per_generation = bounded_usize(
+        "POEX_MAX_CELLS_PER_GENERATION",
+        raw_config.POEX_MAX_CELLS_PER_GENERATION,
+        MAX_CELLS_PER_GENERATION,
+    )?;
+    let max_cell_concurrency = bounded_usize(
+        "POEX_MAX_CELL_CONCURRENCY",
+        raw_config.POEX_MAX_CELL_CONCURRENCY,
+        MAX_CELL_CONCURRENCY,
+    )?;
+    let max_cell_invocations = bounded_u64(
+        "POEX_MAX_CELL_INVOCATIONS",
+        raw_config.POEX_MAX_CELL_INVOCATIONS,
+        MAX_CELL_INVOCATIONS,
+    )?;
+    let cell_idle_ttl_ms = bounded_u64(
+        "POEX_CELL_IDLE_TTL_MS",
+        raw_config.POEX_CELL_IDLE_TTL_MS,
+        MAX_CELL_IDLE_TTL_MS,
+    )?;
+    let max_cell_age_ms = bounded_u64(
+        "POEX_MAX_CELL_AGE_MS",
+        raw_config.POEX_MAX_CELL_AGE_MS,
+        MAX_CELL_AGE_MS,
+    )?;
     let token_path = match raw_config.POEX_DESKTOP_TOKEN_FILE {
         Some(path) if !path.trim().is_empty() => expand_home(Path::new(&path))?,
         _ => default_token_path()?,
@@ -226,11 +274,33 @@ fn load_config() -> Result<RuntimeConfig> {
         addr,
         worker_command,
         worker_args,
+        artifact_root,
         parallelism,
-        pool_size,
+        max_live_cells,
+        max_cells_per_generation,
+        max_cell_concurrency,
+        max_cell_invocations,
+        cell_idle_ttl: Duration::from_millis(cell_idle_ttl_ms),
+        max_cell_age: Duration::from_millis(max_cell_age_ms),
         token_path,
         log_filter: raw_config.POEX_DESKTOP_LOG,
     });
+}
+
+fn bounded_usize(name: &str, value: i64, maximum: usize) -> Result<usize> {
+    let value = usize::try_from(value)
+        .ok()
+        .filter(|value| *value > 0 && *value <= maximum)
+        .ok_or_else(|| anyhow!("{name} must be between 1 and {maximum}"))?;
+    return Ok(value);
+}
+
+fn bounded_u64(name: &str, value: i64, maximum: u64) -> Result<u64> {
+    let value = u64::try_from(value)
+        .ok()
+        .filter(|value| *value > 0 && *value <= maximum)
+        .ok_or_else(|| anyhow!("{name} must be between 1 and {maximum}"))?;
+    return Ok(value);
 }
 
 async fn health() -> &'static str {
@@ -245,16 +315,60 @@ async fn status(
     return Ok(Json(StatusResponse {
         runtime: "pony_native",
         actor_reusable: false,
-        worker_mode: "tenant_generation_process_pool",
+        worker_mode: "warm_tenant_generation_cells",
+        cell_reuse_scope: "same_tenant_generation",
+        security_boundary: "os_process",
+        request_protocol: "u32be_length_prefixed_json_v1",
         config_source: "flags-2-env",
         uptime_ms: state.started_at.elapsed().as_millis(),
         accepted: state.accepted.load(Ordering::Relaxed),
         completed: state.completed.load(Ordering::Relaxed),
         failed: state.failed.load(Ordering::Relaxed),
-        available_slots: state.permits.available_permits(),
-        tenant_pool_size: state.pool_size,
-        live_generation_pools: state.pools.lock().await.len(),
+        live_cells: state.cells.live_cells().await,
+        available_invocation_slots: state.permits.available_permits(),
+        available_cell_slots: state.cells.available_cell_slots(),
+        max_cells_per_generation: state.cells.max_cells_per_generation(),
+        max_cell_concurrency: state.cells.max_cell_concurrency(),
+        max_cell_invocations: state.cells.max_cell_invocations(),
     }));
+}
+
+async fn list_cells(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<CellStatus>>, (StatusCode, String)> {
+    authorize(&headers, &state)?;
+    return Ok(Json(state.cells.statuses().await));
+}
+
+async fn drain_cell_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((tenant_id, deployment_id, cell_index)): AxumPath<(String, String, u32)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    authorize(&headers, &state)?;
+    validate_identifier("tenant_id", &tenant_id)?;
+    validate_identifier("deployment_id", &deployment_id)?;
+    let draining = state
+        .cells
+        .drain(&tenant_id, &deployment_id, cell_index)
+        .await;
+    return Ok(Json(json!({ "draining": draining })));
+}
+
+async fn retire_cell_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((tenant_id, deployment_id, cell_index)): AxumPath<(String, String, u32)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    authorize(&headers, &state)?;
+    validate_identifier("tenant_id", &tenant_id)?;
+    validate_identifier("deployment_id", &deployment_id)?;
+    let retired = state
+        .cells
+        .retire(&tenant_id, &deployment_id, cell_index)
+        .await;
+    return Ok(Json(json!({ "retired": retired })));
 }
 
 async fn invoke(
@@ -269,28 +383,33 @@ async fn invoke(
 
     let timeout_ms = request.timeout_ms.unwrap_or(30_000);
     if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
-        return Err((StatusCode::BAD_REQUEST,
-            format!("timeout_ms must be between 1 and {MAX_TIMEOUT_MS}")));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("timeout_ms must be between 1 and {MAX_TIMEOUT_MS}"),
+        ));
     }
 
-    let permit = state.permits.clone().try_acquire_owned().map_err(|_| {
-        (StatusCode::SERVICE_UNAVAILABLE, "Pony invocation capacity is exhausted".to_owned())
+    let _permit = state.permits.clone().try_acquire_owned().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Pony invocation capacity is exhausted".to_owned(),
+        )
     })?;
     state.accepted.fetch_add(1, Ordering::Relaxed);
-    let key = CellKey {
-        tenant_id: request.tenant_id.clone(),
-        deployment_id: request.deployment_id.clone(),
-    };
-    let pool = ensure_pool(&state, &key).await.map_err(service_unavailable)?;
-    let index = (pool.next.fetch_add(1, Ordering::Relaxed) as usize) % pool.cells.len();
-    let cell = pool.cells[index].clone();
-    let result = invoke_cell(&cell, &request, Duration::from_millis(timeout_ms)).await;
-    drop(permit);
 
+    let result = state
+        .cells
+        .invoke(
+            &request.tenant_id,
+            &request.deployment_id,
+            &request.invocation_id,
+            &request.payload_json,
+            Duration::from_millis(timeout_ms),
+        )
+        .await;
     state.completed.fetch_add(1, Ordering::Relaxed);
     if result.is_err() {
         state.failed.fetch_add(1, Ordering::Relaxed);
-        retire_pool(&state, &key).await;
     }
 
     let response = match result {
@@ -309,92 +428,7 @@ async fn invoke(
             error: Some(error.to_string()),
         },
     };
-    Ok(Json(response))
-}
-
-async fn ensure_pool(state: &AppState, key: &CellKey) -> Result<Arc<CellPool>> {
-    if let Some(pool) = state.pools.lock().await.get(key).cloned() {
-        return Ok(pool);
-    }
-
-    let mut cells = Vec::with_capacity(state.pool_size);
-    for _ in 0..state.pool_size {
-        match spawn_cell(state, key).await {
-            Ok(cell) => cells.push(Arc::new(Mutex::new(cell))),
-            Err(error) => {
-                for cell in cells {
-                    let mut cell = cell.lock().await;
-                    let _ = cell.child.kill().await;
-                    let _ = cell.child.wait().await;
-                }
-                return Err(error);
-            }
-        }
-    }
-    let pool = Arc::new(CellPool { cells, next: AtomicU64::new(0) });
-    let mut pools = state.pools.lock().await;
-    Ok(pools.entry(key.clone()).or_insert_with(|| pool.clone()).clone())
-}
-
-async fn spawn_cell(state: &AppState, key: &CellKey) -> Result<Cell> {
-    let mut child = Command::new(state.worker_command.as_ref())
-        .args(state.worker_args.iter())
-        .env("POEX_TENANT_ID", &key.tenant_id)
-        .env("POEX_DEPLOYMENT_ID", &key.deployment_id)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("failed to start {}", state.worker_command))?;
-    let stdin = child.stdin.take().ok_or_else(|| anyhow!("worker stdin unavailable"))?;
-    let stdout = child.stdout.take().ok_or_else(|| anyhow!("worker stdout unavailable"))?;
-    Ok(Cell { child, stdin, stdout: BufReader::new(stdout), invocation_count: 0 })
-}
-
-async fn invoke_cell(
-    cell: &Arc<Mutex<Cell>>,
-    request: &InvocationRequest,
-    deadline: Duration,
-) -> Result<Value> {
-    let mut cell = cell.lock().await;
-    if cell.child.try_wait()?.is_some() {
-        bail!("Pony tenant cell exited before invocation");
-    }
-    let mut payload = serde_json::to_vec(&request.payload_json)?;
-    if payload.contains(&b'\n') {
-        bail!("serialized invocation payload unexpectedly contains a newline");
-    }
-    payload.push(b'\n');
-    cell.stdin.write_all(&payload).await?;
-    cell.stdin.flush().await?;
-
-    let mut response = String::new();
-    let read = timeout(deadline, cell.stdout.read_line(&mut response))
-        .await
-        .map_err(|_| anyhow!("Pony invocation timed out; generation pool will be retired"))??;
-    if read == 0 {
-        bail!("Pony tenant cell closed its output");
-    }
-    if response.len() > MAX_WORKER_STDOUT_BYTES {
-        bail!("Pony response exceeded {MAX_WORKER_STDOUT_BYTES} bytes");
-    }
-    cell.invocation_count = cell.invocation_count.saturating_add(1);
-    serde_json::from_str(response.trim_end()).context("Pony worker response was not JSON")
-}
-
-async fn retire_pool(state: &AppState, key: &CellKey) {
-    if let Some(pool) = state.pools.lock().await.remove(key) {
-        for cell in &pool.cells {
-            let mut cell = cell.lock().await;
-            let _ = cell.child.kill().await;
-            let _ = cell.child.wait().await;
-        }
-    }
-}
-
-fn service_unavailable(error: impl std::fmt::Display) -> (StatusCode, String) {
-    (StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+    return Ok(Json(response));
 }
 
 fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
@@ -468,6 +502,13 @@ fn default_token_path() -> Result<PathBuf> {
         .or_else(|| env::var_os("USERPROFILE"))
         .ok_or_else(|| anyhow!("HOME or USERPROFILE is required"))?;
     return Ok(PathBuf::from(home).join(".pony-expres/daemon/token"));
+}
+
+fn default_artifact_root() -> Result<PathBuf> {
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .ok_or_else(|| anyhow!("HOME or USERPROFILE is required"))?;
+    return Ok(PathBuf::from(home).join(".pony-expres/artifacts"));
 }
 
 fn expand_home(path: &Path) -> Result<PathBuf> {
@@ -592,26 +633,10 @@ mod tests {
     }
 
     #[test]
-    fn truncates_worker_errors() {
-        let value = "x".repeat(1024);
-        assert_eq!(truncate(&value, 512).len(), 512);
-    }
-
-    #[tokio::test]
-    async fn bounded_drain_keeps_draining_after_limit() {
-        let (mut writer, mut reader) = tokio::io::duplex(64);
-        let write = tokio::spawn(async move {
-            writer.write_all(b"0123456789abcdef").await?;
-            writer.shutdown().await?;
-            return Ok::<_, std::io::Error>(());
-        });
-
-        let capture = drain_bounded(&mut reader, 8).await;
-        assert!(capture.is_ok());
-        if let Ok(capture) = capture {
-            assert_eq!(capture.bytes, b"01234567");
-            assert!(capture.exceeded);
-        }
-        assert!(write.await.is_ok());
+    fn numeric_limits_are_bounded() {
+        assert_eq!(bounded_usize("x", 4, 8).ok(), Some(4));
+        assert!(bounded_usize("x", 0, 8).is_err());
+        assert!(bounded_usize("x", 9, 8).is_err());
+        assert_eq!(bounded_u64("x", 4, 8).ok(), Some(4));
     }
 }
