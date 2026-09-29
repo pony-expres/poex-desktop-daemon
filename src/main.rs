@@ -221,7 +221,10 @@ fn load_config() -> Result<RuntimeConfig> {
         .parse_structured(&argv, Some(config_path_text))
         .map_err(|error| anyhow!(error.to_string()))?;
     if !parsed.unknown_options.is_empty() {
-        bail!("unknown command-line options: {}", parsed.unknown_options.len());
+        bail!(
+            "unknown command-line options: {}",
+            parsed.unknown_options.len()
+        );
     }
     if !parsed.errors.is_empty() {
         bail!("invalid command-line values: {}", parsed.errors.join("; "));
@@ -255,7 +258,11 @@ fn load_config() -> Result<RuntimeConfig> {
         raw_config.POEX_MAX_PARALLEL_INVOCATIONS,
         MAX_PARALLELISM,
     )?;
-    let pool_size = bounded_usize("POEX_TENANT_POOL_SIZE", raw_config.POEX_TENANT_POOL_SIZE, 16)?;
+    let pool_size = bounded_usize(
+        "POEX_TENANT_POOL_SIZE",
+        raw_config.POEX_TENANT_POOL_SIZE,
+        16,
+    )?;
     let max_live_cells = bounded_usize(
         "POEX_MAX_LIVE_CELLS",
         raw_config.POEX_MAX_LIVE_CELLS,
@@ -526,11 +533,10 @@ async fn spawn_pool(state: &AppState, key: &CellKey) -> Result<Arc<CellPool>> {
 }
 
 async fn spawn_cell(state: &AppState, key: &CellKey) -> Result<Cell> {
-    let live_permit = state
-        .cell_slots
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| anyhow!("live Pony cell limit reached; retire an idle generation first"))?;
+    let live_permit =
+        state.cell_slots.clone().try_acquire_owned().map_err(|_| {
+            anyhow!("live Pony cell limit reached; retire an idle generation first")
+        })?;
 
     let executable = worker_executable(state, key)?;
     let mut child = Command::new(&executable)
