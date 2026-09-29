@@ -169,7 +169,9 @@ impl CellPool {
 
         if result.is_err() {
             cell.failed.store(true, Ordering::Release);
-            let _ = self.retire(&key.tenant_id, &key.deployment_id, cell.index).await;
+            let _ = self
+                .retire(&key.tenant_id, &key.deployment_id, cell.index)
+                .await;
         } else if cell.invocation_count.load(Ordering::Relaxed)
             >= self.inner.config.max_cell_invocations
         {
@@ -505,16 +507,22 @@ async fn read_worker_stdout(
         let mut bytes = vec![0_u8; length];
         if let Err(error) = stdout.read_exact(&mut bytes).await {
             failed.store(true, Ordering::Release);
-            fail_all_pending(&pending, &format!("Pony cell response was truncated: {error}"))
-                .await;
+            fail_all_pending(
+                &pending,
+                &format!("Pony cell response was truncated: {error}"),
+            )
+            .await;
             return;
         }
         let frame = match serde_json::from_slice::<Value>(&bytes) {
             Ok(frame) => frame,
             Err(error) => {
                 failed.store(true, Ordering::Release);
-                fail_all_pending(&pending, &format!("Pony cell returned invalid JSON: {error}"))
-                    .await;
+                fail_all_pending(
+                    &pending,
+                    &format!("Pony cell returned invalid JSON: {error}"),
+                )
+                .await;
                 return;
             }
         };
@@ -540,11 +548,7 @@ async fn read_worker_stdout(
     }
 }
 
-async fn read_worker_stderr(
-    key: CellKey,
-    index: u32,
-    stderr: tokio::process::ChildStderr,
-) {
+async fn read_worker_stderr(key: CellKey, index: u32, stderr: tokio::process::ChildStderr) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         tracing::warn!(
