@@ -1,0 +1,49 @@
+name: materialize-generation-identity
+
+on:
+  push:
+    branches:
+      - alexanderdmills/den-3045-generation-identity
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact hardening branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: alexanderdmills/den-3045-generation-identity
+          persist-credentials: true
+      - name: Install declared MSRV
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: "1.90.0"
+          components: rustfmt, clippy
+      - name: Add SHA-256 dependency through Cargo
+        shell: bash
+        run: cargo +1.90.0 add sha2@0.10
+      - name: Apply generation identity policy
+        shell: bash
+        run: python3 .github/materialize-generation-identity.py
+      - name: Format
+        run: cargo +1.90.0 fmt --all
+      - name: Verify formatting
+        run: cargo +1.90.0 fmt --all -- --check
+      - name: Clippy
+        run: cargo +1.90.0 clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo +1.90.0 test --locked --all-targets
+      - name: Commit generated lock and source hardening, remove bootstrap files
+        shell: bash
+        run: |
+          rm .github/workflows/materialize-generation-identity.yml
+          rm .github/materialize-generation-identity.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock src/cells.rs .cli-flags.toml .github/workflows/materialize-generation-identity.yml .github/materialize-generation-identity.py
+          git commit -m 'runtime: fence Pony warm reuse by generation identity'
+          git push origin HEAD:alexanderdmills/den-3045-generation-identity
