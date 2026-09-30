@@ -1,0 +1,108 @@
+name: materialize-constant-time-auth
+
+on:
+  push:
+    branches:
+      - alexanderdmills/den-3045-constant-time-auth
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out exact hardening branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: alexanderdmills/den-3045-constant-time-auth
+          persist-credentials: true
+      - name: Install declared MSRV
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: "1.90.0"
+          components: rustfmt, clippy
+      - name: Apply narrowly scoped authorization patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/main.rs')
+          text = path.read_text()
+          old = '''fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
+              let provided = headers
+                  .get(axum::http::header::AUTHORIZATION)
+                  .and_then(|value| value.to_str().ok())
+                  .and_then(|value| value.strip_prefix("Bearer "));
+
+              if provided == Some(state.token.as_ref()) {
+                  return Ok(());
+              }
+
+              return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_owned()));
+          }
+          '''
+          new = '''fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
+              let provided = headers
+                  .get(axum::http::header::AUTHORIZATION)
+                  .and_then(|value| value.to_str().ok())
+                  .and_then(|value| value.strip_prefix("Bearer "));
+
+              if provided.is_some_and(|token| constant_time_eq(token.as_bytes(), state.token.as_bytes())) {
+                  return Ok(());
+              }
+
+              return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_owned()));
+          }
+
+          fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+              let max_len = left.len().max(right.len());
+              let mut difference = left.len() ^ right.len();
+              for index in 0..max_len {
+                  difference |= usize::from(
+                      left.get(index).copied().unwrap_or_default()
+                          ^ right.get(index).copied().unwrap_or_default(),
+                  );
+              }
+              return difference == 0;
+          }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit('authorization block did not match exactly once')
+          text = text.replace(old, new)
+          text += '''
+
+          #[cfg(test)]
+          mod constant_time_auth_tests {
+              use super::constant_time_eq;
+
+              #[test]
+              fn constant_time_token_comparison_matches_only_exact_bytes() {
+                  assert!(constant_time_eq(b"abcdefghijklmnopqrstuvwxyz012345", b"abcdefghijklmnopqrstuvwxyz012345"));
+                  assert!(!constant_time_eq(b"abcdefghijklmnopqrstuvwxyz012345", b"abcdefghijklmnopqrstuvwxyz012346"));
+                  assert!(!constant_time_eq(b"short", b"shorter"));
+                  assert!(!constant_time_eq(b"longer", b"long"));
+              }
+          }
+          '''
+          path.write_text(text)
+          PY
+      - name: Format source
+        run: cargo +1.90.0 fmt --all
+      - name: Verify formatting
+        run: cargo +1.90.0 fmt --all -- --check
+      - name: Clippy
+        run: cargo +1.90.0 clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo +1.90.0 test --locked --all-targets
+      - name: Commit source hardening and remove bootstrap workflow
+        shell: bash
+        run: |
+          rm .github/workflows/materialize-constant-time-auth.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/main.rs .github/workflows/materialize-constant-time-auth.yml
+          git commit -m 'security: compare desktop bearer token without early exit'
+          git push origin HEAD:alexanderdmills/den-3045-constant-time-auth
