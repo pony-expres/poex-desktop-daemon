@@ -11,6 +11,7 @@ axum = "0.8"
 flags2env = { git = "https://github.com/flags-2-env/flags-2-env.git", rev = "8c8465561075a8d7ebb58074b3a8087138e97d8f" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

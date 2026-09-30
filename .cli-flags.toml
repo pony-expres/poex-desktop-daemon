@@ -18,7 +18,7 @@ env = "POEX_WORKER_COMMAND"
 aliases = ["worker"]
 type = "string"
 default = "poex-lambda"
-help = "Development fallback Pony worker. Immutable tenant deployment artifacts are preferred when present."
+help = "Development fallback Pony worker. Deployment artifacts are preferred; explicit regular-file fallbacks may be warm-reused by digest, while PATH-only fallbacks are fresh-cell only."
 
 [flags.worker-args-json]
 env = "POEX_WORKER_ARGS_JSON"
