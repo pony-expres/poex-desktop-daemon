@@ -437,11 +437,23 @@ fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, S
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
 
-    if provided == Some(state.token.as_ref()) {
+    if provided.is_some_and(|token| constant_time_eq(token.as_bytes(), state.token.as_bytes())) {
         return Ok(());
     }
 
     return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_owned()));
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut difference = left.len() ^ right.len();
+    for index in 0..max_len {
+        difference |= usize::from(
+            left.get(index).copied().unwrap_or_default()
+                ^ right.get(index).copied().unwrap_or_default(),
+        );
+    }
+    return difference == 0;
 }
 
 fn validate_identifier(name: &str, value: &str) -> Result<(), (StatusCode, String)> {
@@ -642,3 +654,22 @@ mod tests {
 }
 
 // rustfmt EOF sentinel
+
+#[cfg(test)]
+mod constant_time_auth_tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn constant_time_token_comparison_matches_only_exact_bytes() {
+        assert!(constant_time_eq(
+            b"abcdefghijklmnopqrstuvwxyz012345",
+            b"abcdefghijklmnopqrstuvwxyz012345"
+        ));
+        assert!(!constant_time_eq(
+            b"abcdefghijklmnopqrstuvwxyz012345",
+            b"abcdefghijklmnopqrstuvwxyz012346"
+        ));
+        assert!(!constant_time_eq(b"short", b"shorter"));
+        assert!(!constant_time_eq(b"longer", b"long"));
+    }
+}
